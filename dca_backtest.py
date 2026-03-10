@@ -7,20 +7,20 @@ from pathlib import Path
 # CONFIGURATION
 # =============================================================================
 
-DIRECTION         = "LONG"        # "LONG" or "SHORT"
+DIRECTION         = "SHORT"        # "LONG" or "SHORT"
 LEVERAGE          = 5            # leverage multiplier (e.g. 10 = 10x)
 TOTAL_CAPITAL     = 100.0        # USD — total capital to deploy across all bullets
 TOTAL_BULLETS     = 30            # number of bullets in the pool
 INITIAL_BULLETS   = 2             # bullets used to open the first entry
 
 TP_PCT            = 20.0          # take profit: close when ROI on margin >= this %
-SL_PCT            = 50.0          # stop loss:   close when ROI on margin <= -this % (None = off)
+SL_PCT            = 90.0          # stop loss:   close when ROI on margin <= -this % (None = off)
 
 BULLET_INTERVAL_H = 24            # hours between each DCA check / bullet add
 
 PAIR              = "ETHUSDT"
 INTERVAL          = "4h"          # must match an existing {PAIR}_{INTERVAL}.csv file
-START_DATE        = "2022-01-01"  # inclusive  "YYYY-MM-DD"
+START_DATE        = "2026-01-01"  # inclusive  "YYYY-MM-DD"
 END_DATE          = "2026-03-9"  # inclusive  "YYYY-MM-DD"
 
 # DCA tier table — evaluated top to bottom, first match wins.
@@ -105,6 +105,22 @@ class Position:
         else:
             return avg * (1 + eff_rate - mmr)
 
+    def tp_price(self, tp_pct: float) -> float:
+        """Exact price that produces tp_pct% ROI on this position."""
+        avg = self.avg_entry_price
+        if self.direction == "LONG":
+            return avg * (1 + tp_pct / (self.leverage * 100))
+        else:
+            return avg * (1 - tp_pct / (self.leverage * 100))
+
+    def sl_price(self, sl_pct: float) -> float:
+        """Exact price that produces -sl_pct% ROI on this position."""
+        avg = self.avg_entry_price
+        if self.direction == "LONG":
+            return avg * (1 - sl_pct / (self.leverage * 100))
+        else:
+            return avg * (1 + sl_pct / (self.leverage * 100))
+
 
 @dataclass
 class TradeRecord:
@@ -120,6 +136,13 @@ class TradeRecord:
     pnl_usd:               float
     roi_pct:               float
     exit_reason:           str   # TP | SL | LIQUIDATION | END_OF_PERIOD
+    # ── Analysis columns ──────────────────────────────────────────────────────
+    capital_before:       float = 0.0  # running_capital when the trade opened
+    capital_after:        float = 0.0  # running_capital after close (set post-cycle)
+    duration_hours:       float = 0.0  # time in trade (hours)
+    bullet_value_at_open: float = 0.0  # USD per bullet at the time of entry
+    price_change_pct:     float = 0.0  # raw unleveraged price move (entry → exit) %
+    capital_pct_risked:   float = 0.0  # total_margin_usd / capital_before × 100
 
 
 @dataclass
@@ -164,6 +187,10 @@ def export_trades(records: list[TradeRecord]) -> None:
         "avg_entry_price", "exit_price", "bullets_used_position",
         "bullets_used_margin", "total_margin_usd", "pnl_usd",
         "roi_pct", "exit_reason",
+        # analysis columns
+        "capital_before", "capital_after",
+        "duration_hours", "bullet_value_at_open",
+        "price_change_pct", "capital_pct_risked",
     ]
     with open("trades_log.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -182,6 +209,12 @@ def export_trades(records: list[TradeRecord]) -> None:
                 "pnl_usd":               f"{r.pnl_usd:.2f}",
                 "roi_pct":               f"{r.roi_pct:.2f}",
                 "exit_reason":           r.exit_reason,
+                "capital_before":        f"{r.capital_before:.2f}",
+                "capital_after":         f"{r.capital_after:.2f}",
+                "duration_hours":        f"{r.duration_hours:.1f}",
+                "bullet_value_at_open":  f"{r.bullet_value_at_open:.4f}",
+                "price_change_pct":      f"{r.price_change_pct:.4f}",
+                "capital_pct_risked":    f"{r.capital_pct_risked:.2f}",
             })
 
 
@@ -229,15 +262,23 @@ def open_position(price: float, n_bullets: int, bullet_value: float,
 
 
 def close_trade(pos: Position, exit_price: float, exit_time: datetime,
-                entry_time: datetime, trade_id: int, exit_reason: str) -> TradeRecord:
-    pnl = pos.unrealized_pnl(exit_price)
-    roi = pos.roi_pct(exit_price)
+                entry_time: datetime, trade_id: int, exit_reason: str,
+                capital_before: float, bullet_value_at_open: float) -> TradeRecord:
+    pnl      = pos.unrealized_pnl(exit_price)
+    roi      = pos.roi_pct(exit_price)
+    avg      = pos.avg_entry_price
+    dur_h    = (exit_time - entry_time).total_seconds() / 3600
+    if pos.direction == "LONG":
+        price_chg = (exit_price - avg) / avg * 100
+    else:
+        price_chg = (avg - exit_price) / avg * 100
+    cap_risked = pos.total_effective_margin / capital_before * 100 if capital_before > 0 else 0.0
     return TradeRecord(
         trade_id              = trade_id,
         entry_time            = dt_str(entry_time),
         exit_time             = dt_str(exit_time),
         direction             = pos.direction,
-        avg_entry_price       = pos.avg_entry_price,
+        avg_entry_price       = avg,
         exit_price            = exit_price,
         bullets_used_position = pos.bullets_position_used,
         bullets_used_margin   = pos.bullets_margin_used,
@@ -245,6 +286,12 @@ def close_trade(pos: Position, exit_price: float, exit_time: datetime,
         pnl_usd               = pnl,
         roi_pct               = roi,
         exit_reason           = exit_reason,
+        capital_before        = round(capital_before, 4),
+        capital_after         = 0.0,   # filled in after _end_trade_cycle
+        duration_hours        = round(dur_h, 1),
+        bullet_value_at_open  = round(bullet_value_at_open, 4),
+        price_change_pct      = round(price_chg, 4),
+        capital_pct_risked    = round(cap_risked, 2),
     )
 
 
@@ -256,7 +303,7 @@ def run_backtest():
     end_dt   = datetime.strptime(END_DATE,   "%Y-%m-%d").replace(tzinfo=timezone.utc) \
                + timedelta(days=1) - timedelta(seconds=1)
 
-    print(f"Loading {PAIR}_{INTERVAL}.csv  [{START_DATE} → {END_DATE}] …")
+    print(f"Loading {PAIR}_{INTERVAL}.csv  [{START_DATE} to {END_DATE}] ...")
     candles = load_klines(PAIR, INTERVAL, start_dt, end_dt)
     if not candles:
         print("No candles found for the given date range.")
@@ -269,6 +316,7 @@ def run_backtest():
 
     pos: Position | None = None
     entry_time: datetime | None = None
+    open_bullet_value: float = 0.0   # bullet_value captured at position open
     next_check  = candles[0]["open_time"]
     trade_id    = 0
 
@@ -311,72 +359,91 @@ def run_backtest():
         ts    = candle["open_time"]
         o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
 
-        # ── 1. Liquidation check ─────────────────────────────────────────────
+        just_opened = False   # new position opened this candle → skip DCA in timer block
+
+        # ── 1. Liquidation check (every candle, highest priority) ─────────────
         if pos is not None:
             liq = pos.liquidation_price()
-            triggered = (pos.direction == "LONG"  and l <= liq) or \
-                        (pos.direction == "SHORT" and h >= liq)
-            if triggered:
-                liq_price = liq
+            if (pos.direction == "LONG"  and l <= liq) or \
+               (pos.direction == "SHORT" and h >= liq):
                 trade_id += 1
-                t = close_trade(pos, liq_price, ts, entry_time, trade_id, "LIQUIDATION")
+                t = close_trade(pos, liq, ts, entry_time, trade_id, "LIQUIDATION",
+                                capital_before=running_capital,
+                                bullet_value_at_open=open_bullet_value)
                 trades.append(t)
-                print(f"  [{dt_str(ts)}] LIQUIDATED at {liq_price:.2f}  "
+                _end_trade_cycle(t.pnl_usd)
+                t.capital_after = running_capital
+                print(f"  [{dt_str(ts)}] LIQUIDATED at {liq:.2f}  "
+                      f"PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
+                pos = None
+
+        # ── 2. TP / SL check (every candle, exact target price) ───────────────
+        if pos is not None:
+            tp_px = pos.tp_price(TP_PCT)
+            sl_px = pos.sl_price(SL_PCT) if SL_PCT is not None else None
+
+            tp_hit = (pos.direction == "LONG"  and h >= tp_px) or \
+                     (pos.direction == "SHORT" and l <= tp_px)
+            sl_hit = sl_px is not None and (
+                (pos.direction == "LONG"  and l <= sl_px) or
+                (pos.direction == "SHORT" and h >= sl_px)
+            )
+
+            if tp_hit:
+                trade_id += 1
+                t = close_trade(pos, tp_px, ts, entry_time, trade_id, "TP",
+                                capital_before=running_capital,
+                                bullet_value_at_open=open_bullet_value)
+                trades.append(t)
+                print(f"  [{dt_str(ts)}] TP    @ {tp_px:.2f}  ROI={t.roi_pct:+.1f}%  "
+                      f"PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
+                _end_trade_cycle(t.pnl_usd)
+                t.capital_after = running_capital
+                # Immediately reopen at the TP price (if still solvent)
+                if bullets_pos_rem > 0:
+                    n = min(INITIAL_BULLETS, bullets_pos_rem)
+                    pos               = open_position(tp_px, n, bullet_value, DIRECTION, LEVERAGE)
+                    entry_time        = ts
+                    open_bullet_value = bullet_value
+                    bullets_pos_rem  -= n
+                    _log_bullet(ts, tp_px, "OPEN", n, pos)
+                    print(f"  [{dt_str(ts)}] OPEN  {n} bullets @ {tp_px:.2f}  "
+                          f"avg={pos.avg_entry_price:.2f}  liq={pos.liquidation_price():.2f}")
+                    just_opened = True
+                else:
+                    pos = None
+
+            elif sl_hit:
+                trade_id += 1
+                t = close_trade(pos, sl_px, ts, entry_time, trade_id, "SL",
+                                capital_before=running_capital,
+                                bullet_value_at_open=open_bullet_value)
+                trades.append(t)
+                print(f"  [{dt_str(ts)}] SL    @ {sl_px:.2f}  ROI={t.roi_pct:+.1f}%  "
                       f"PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
                 pos = None
                 _end_trade_cycle(t.pnl_usd)
-                # Don't open a new position mid-candle after liquidation;
-                # the next bullet_check will open one.
+                t.capital_after = running_capital
 
-        # ── 2. Bullet check ──────────────────────────────────────────────────
+        # ── 3. Bullet-interval check (open new position or DCA) ───────────────
         if ts >= next_check:
             next_check += timedelta(hours=BULLET_INTERVAL_H)
 
             if pos is None and bullets_pos_rem > 0:
-                # Open new position
+                # Open a new position (initial entry, or after SL/liq waited for timer)
                 n = min(INITIAL_BULLETS, bullets_pos_rem)
-                pos        = open_position(o, n, bullet_value, DIRECTION, LEVERAGE)
-                entry_time = ts
-                bullets_pos_rem -= n
+                pos               = open_position(o, n, bullet_value, DIRECTION, LEVERAGE)
+                entry_time        = ts
+                open_bullet_value = bullet_value
+                bullets_pos_rem  -= n
                 _log_bullet(ts, o, "OPEN", n, pos)
                 print(f"  [{dt_str(ts)}] OPEN  {n} bullets @ {o:.2f}  "
                       f"avg={pos.avg_entry_price:.2f}  liq={pos.liquidation_price():.2f}")
 
-            elif pos is not None:
+            elif pos is not None and not just_opened:
+                # DCA — TP/SL are handled per-candle above, only add bullets here
                 roi = pos.roi_pct(c)
-
-                # Take profit
-                if roi >= TP_PCT:
-                    trade_id += 1
-                    t = close_trade(pos, c, ts, entry_time, trade_id, "TP")
-                    trades.append(t)
-                    print(f"  [{dt_str(ts)}] TP    @ {c:.2f}  ROI={roi:+.1f}%  "
-                          f"PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
-                    _end_trade_cycle(t.pnl_usd)
-                    # Immediately open next position (if still solvent)
-                    if bullets_pos_rem > 0:
-                        n = min(INITIAL_BULLETS, bullets_pos_rem)
-                        pos        = open_position(c, n, bullet_value, DIRECTION, LEVERAGE)
-                        entry_time = ts
-                        bullets_pos_rem -= n
-                        _log_bullet(ts, c, "OPEN", n, pos)
-                        print(f"  [{dt_str(ts)}] OPEN  {n} bullets @ {c:.2f}  "
-                              f"avg={pos.avg_entry_price:.2f}  liq={pos.liquidation_price():.2f}")
-                    else:
-                        pos = None
-
-                # Stop loss
-                elif SL_PCT is not None and roi <= -SL_PCT:
-                    trade_id += 1
-                    t = close_trade(pos, c, ts, entry_time, trade_id, "SL")
-                    trades.append(t)
-                    print(f"  [{dt_str(ts)}] SL    @ {c:.2f}  ROI={roi:+.1f}%  "
-                          f"PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
-                    pos = None
-                    _end_trade_cycle(t.pnl_usd)
-
-                # DCA
-                elif bullets_pos_rem > 0 or bullets_mar_rem > 0:
+                if bullets_pos_rem > 0 or bullets_mar_rem > 0:
                     tier_pos, tier_mar = find_dca_tier(roi)
 
                     # Add to position
@@ -384,7 +451,7 @@ def run_backtest():
                         add_pos = min(tier_pos, bullets_pos_rem)
                         pos.entries.append((c, bullet_value * add_pos))
                         pos.bullets_position_used += add_pos
-                        bullets_pos_rem -= add_pos
+                        bullets_pos_rem           -= add_pos
                         _log_bullet(ts, c, "DCA_POSITION", add_pos, pos)
                         print(f"  [{dt_str(ts)}] DCA   +{add_pos} pos bullets @ {c:.2f}  "
                               f"ROI={roi:+.1f}%  avg={pos.avg_entry_price:.2f}  "
@@ -398,20 +465,18 @@ def run_backtest():
                         bullets_mar_rem           -= add_mar
                         _log_bullet(ts, c, "DCA_MARGIN", add_mar, pos)
                         print(f"  [{dt_str(ts)}] DCA   +{add_mar} margin bullets  "
-                              f"liq → {pos.liquidation_price():.2f}  rem={bullets_mar_rem}")
-
+                              f"liq={pos.liquidation_price():.2f}  rem={bullets_mar_rem}")
                 else:
                     print(f"  [{dt_str(ts)}] WAIT  bullets exhausted  ROI={roi:+.1f}%")
 
-        # ── 3. Equity tracking (for max drawdown) ────────────────────────────
-        # running_capital already reflects all closed-trade PnLs; add unrealized PnL if open
+        # ── 4. Equity tracking (for max drawdown) ─────────────────────────────
         if pos is not None:
             equity = running_capital + pos.unrealized_pnl(c)
         else:
             equity = running_capital
         equity_curve.append(equity)
-        peak_equity = max(peak_equity, equity)
-        drawdown    = peak_equity - equity
+        peak_equity  = max(peak_equity, equity)
+        drawdown     = peak_equity - equity
         max_drawdown = max(max_drawdown, drawdown)
 
     # ── Close any remaining open position ────────────────────────────────────
@@ -419,9 +484,12 @@ def run_backtest():
         last   = candles[-1]
         trade_id += 1
         t = close_trade(pos, last["close"], last["open_time"],
-                        entry_time, trade_id, "END_OF_PERIOD")
+                        entry_time, trade_id, "END_OF_PERIOD",
+                        capital_before=running_capital,
+                        bullet_value_at_open=open_bullet_value)
         trades.append(t)
         _end_trade_cycle(t.pnl_usd)
+        t.capital_after = running_capital
         print(f"  [{dt_str(last['open_time'])}] END   closed @ {last['close']:.2f}  "
               f"ROI={t.roi_pct:+.1f}%  PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
 
@@ -438,9 +506,9 @@ def run_backtest():
     print("=" * 42)
     print("       BACKTEST RESULTS")
     print("=" * 42)
-    print(f"  Period      : {START_DATE} → {END_DATE}")
+    print(f"  Period      : {START_DATE} to {END_DATE}")
     print(f"  Pair        : {PAIR} {INTERVAL}  |  {DIRECTION}  |  {LEVERAGE}x")
-    print(f"  Capital     : ${TOTAL_CAPITAL:,.2f} → ${running_capital:,.2f}  "
+    print(f"  Capital     : ${TOTAL_CAPITAL:,.2f} -> ${running_capital:,.2f}  "
           f"({TOTAL_BULLETS} bullets)")
     print("-" * 42)
     print(f"  Trades      : {len(trades)}  ({len(wins)} wins, {len(losses)} losses)")
@@ -455,8 +523,8 @@ def run_backtest():
     # ── Export CSVs ───────────────────────────────────────────────────────────
     export_trades(trades)
     export_bullets(bullet_log)
-    print(f"\n  trades_log.csv  → {len(trades)} rows")
-    print(f"  bullets_log.csv → {len(bullet_log)} rows")
+    print(f"\n  trades_log.csv  : {len(trades)} rows")
+    print(f"  bullets_log.csv : {len(bullet_log)} rows")
 
 
 if __name__ == "__main__":
