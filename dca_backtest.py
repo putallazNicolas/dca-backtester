@@ -7,20 +7,20 @@ from pathlib import Path
 # CONFIGURATION
 # =============================================================================
 
-DIRECTION         = "SHORT"        # "LONG" or "SHORT"
+DIRECTION         = "LONG"        # "LONG" or "SHORT"
 LEVERAGE          = 5            # leverage multiplier (e.g. 10 = 10x)
 TOTAL_CAPITAL     = 100.0        # USD — total capital to deploy across all bullets
 TOTAL_BULLETS     = 30            # number of bullets in the pool
-INITIAL_BULLETS   = 3             # bullets used to open the first entry
+INITIAL_BULLETS   = 2             # bullets used to open the first entry
 
-TP_PCT            = 15.0          # take profit: close when ROI on margin >= this %
-SL_PCT            = None          # stop loss:   close when ROI on margin <= -this % (None = off)
+TP_PCT            = 20.0          # take profit: close when ROI on margin >= this %
+SL_PCT            = 50.0          # stop loss:   close when ROI on margin <= -this % (None = off)
 
 BULLET_INTERVAL_H = 24            # hours between each DCA check / bullet add
 
-PAIR              = "BTCUSDT"
-INTERVAL          = "1h"          # must match an existing {PAIR}_{INTERVAL}.csv file
-START_DATE        = "2026-01-01"  # inclusive  "YYYY-MM-DD"
+PAIR              = "ETHUSDT"
+INTERVAL          = "4h"          # must match an existing {PAIR}_{INTERVAL}.csv file
+START_DATE        = "2022-01-01"  # inclusive  "YYYY-MM-DD"
 END_DATE          = "2026-03-9"  # inclusive  "YYYY-MM-DD"
 
 # DCA tier table — evaluated top to bottom, first match wins.
@@ -32,7 +32,8 @@ DCA_TIERS = [
     ( -5.0, 2, 0),           # -5% ≤ ROI < 0%     → +2 position bullets
     (-10.0, 3, 0),           # -10% ≤ ROI < -5%   → +3 position bullets
     (-15.0, 4, 0),           # -15% ≤ ROI < -10%  → +4 position bullets
-    (-40.0, 5, 0),           # -40% ≤ ROI < -15%  → +5 position bullets
+    (-20.0, 5, 0),           # -20% ≤ ROI < -15%  → +5 position bullets
+    (-40.0, 6, 0),           # -40% ≤ ROI < -15%  → +5 position bullets
     (float("-inf"), 3, 3),   #  ROI < -40%         → +3 position + +3 margin
 ]
 
@@ -261,7 +262,8 @@ def run_backtest():
         print("No candles found for the given date range.")
         return
 
-    bullet_value      = TOTAL_CAPITAL / TOTAL_BULLETS
+    running_capital   = TOTAL_CAPITAL        # tracks real equity across trade cycles
+    bullet_value      = running_capital / TOTAL_BULLETS
     bullets_pos_rem   = TOTAL_BULLETS     # position bullets remaining
     bullets_mar_rem   = TOTAL_BULLETS     # margin  bullets remaining (same pool shown separately)
 
@@ -288,10 +290,22 @@ def run_backtest():
             bullets_remaining = bullets_pos_rem,
         ))
 
-    def _reset_bullets():
-        nonlocal bullets_pos_rem, bullets_mar_rem
-        bullets_pos_rem = TOTAL_BULLETS
-        bullets_mar_rem = TOTAL_BULLETS
+    # Minimum capital to keep trading — one bullet must be worth at least $0.01
+    MIN_CAPITAL = TOTAL_BULLETS * 0.01
+
+    def _end_trade_cycle(pnl: float):
+        """Update running capital after a trade closes and reset the bullet pool."""
+        nonlocal running_capital, bullet_value, bullets_pos_rem, bullets_mar_rem
+        running_capital += pnl
+        if running_capital <= MIN_CAPITAL:
+            running_capital = 0
+            bullets_pos_rem = 0
+            bullets_mar_rem = 0
+            print("  *** BANKRUPT — no capital remaining, simulation stopped ***")
+        else:
+            bullets_pos_rem = TOTAL_BULLETS
+            bullets_mar_rem = TOTAL_BULLETS
+            bullet_value    = running_capital / TOTAL_BULLETS
 
     for candle in candles:
         ts    = candle["open_time"]
@@ -305,10 +319,12 @@ def run_backtest():
             if triggered:
                 liq_price = liq
                 trade_id += 1
-                trades.append(close_trade(pos, liq_price, ts, entry_time, trade_id, "LIQUIDATION"))
-                print(f"  [{dt_str(ts)}] LIQUIDATED at {liq_price:.2f}  (trade #{trade_id})")
+                t = close_trade(pos, liq_price, ts, entry_time, trade_id, "LIQUIDATION")
+                trades.append(t)
+                print(f"  [{dt_str(ts)}] LIQUIDATED at {liq_price:.2f}  "
+                      f"PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
                 pos = None
-                _reset_bullets()
+                _end_trade_cycle(t.pnl_usd)
                 # Don't open a new position mid-candle after liquidation;
                 # the next bullet_check will open one.
 
@@ -316,7 +332,7 @@ def run_backtest():
         if ts >= next_check:
             next_check += timedelta(hours=BULLET_INTERVAL_H)
 
-            if pos is None:
+            if pos is None and bullets_pos_rem > 0:
                 # Open new position
                 n = min(INITIAL_BULLETS, bullets_pos_rem)
                 pos        = open_position(o, n, bullet_value, DIRECTION, LEVERAGE)
@@ -326,31 +342,38 @@ def run_backtest():
                 print(f"  [{dt_str(ts)}] OPEN  {n} bullets @ {o:.2f}  "
                       f"avg={pos.avg_entry_price:.2f}  liq={pos.liquidation_price():.2f}")
 
-            else:
+            elif pos is not None:
                 roi = pos.roi_pct(c)
 
                 # Take profit
                 if roi >= TP_PCT:
                     trade_id += 1
-                    trades.append(close_trade(pos, c, ts, entry_time, trade_id, "TP"))
-                    print(f"  [{dt_str(ts)}] TP    @ {c:.2f}  ROI={roi:+.1f}%  (trade #{trade_id})")
-                    _reset_bullets()
-                    # Immediately open next position
-                    n = min(INITIAL_BULLETS, bullets_pos_rem)
-                    pos        = open_position(c, n, bullet_value, DIRECTION, LEVERAGE)
-                    entry_time = ts
-                    bullets_pos_rem -= n
-                    _log_bullet(ts, c, "OPEN", n, pos)
-                    print(f"  [{dt_str(ts)}] OPEN  {n} bullets @ {c:.2f}  "
-                          f"avg={pos.avg_entry_price:.2f}  liq={pos.liquidation_price():.2f}")
+                    t = close_trade(pos, c, ts, entry_time, trade_id, "TP")
+                    trades.append(t)
+                    print(f"  [{dt_str(ts)}] TP    @ {c:.2f}  ROI={roi:+.1f}%  "
+                          f"PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
+                    _end_trade_cycle(t.pnl_usd)
+                    # Immediately open next position (if still solvent)
+                    if bullets_pos_rem > 0:
+                        n = min(INITIAL_BULLETS, bullets_pos_rem)
+                        pos        = open_position(c, n, bullet_value, DIRECTION, LEVERAGE)
+                        entry_time = ts
+                        bullets_pos_rem -= n
+                        _log_bullet(ts, c, "OPEN", n, pos)
+                        print(f"  [{dt_str(ts)}] OPEN  {n} bullets @ {c:.2f}  "
+                              f"avg={pos.avg_entry_price:.2f}  liq={pos.liquidation_price():.2f}")
+                    else:
+                        pos = None
 
                 # Stop loss
                 elif SL_PCT is not None and roi <= -SL_PCT:
                     trade_id += 1
-                    trades.append(close_trade(pos, c, ts, entry_time, trade_id, "SL"))
-                    print(f"  [{dt_str(ts)}] SL    @ {c:.2f}  ROI={roi:+.1f}%  (trade #{trade_id})")
+                    t = close_trade(pos, c, ts, entry_time, trade_id, "SL")
+                    trades.append(t)
+                    print(f"  [{dt_str(ts)}] SL    @ {c:.2f}  ROI={roi:+.1f}%  "
+                          f"PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
                     pos = None
-                    _reset_bullets()
+                    _end_trade_cycle(t.pnl_usd)
 
                 # DCA
                 elif bullets_pos_rem > 0 or bullets_mar_rem > 0:
@@ -381,11 +404,11 @@ def run_backtest():
                     print(f"  [{dt_str(ts)}] WAIT  bullets exhausted  ROI={roi:+.1f}%")
 
         # ── 3. Equity tracking (for max drawdown) ────────────────────────────
+        # running_capital already reflects all closed-trade PnLs; add unrealized PnL if open
         if pos is not None:
-            equity = (TOTAL_CAPITAL - pos.total_effective_margin) + \
-                     pos.total_effective_margin + pos.unrealized_pnl(c)
+            equity = running_capital + pos.unrealized_pnl(c)
         else:
-            equity = TOTAL_CAPITAL + sum(t.pnl_usd for t in trades)
+            equity = running_capital
         equity_curve.append(equity)
         peak_equity = max(peak_equity, equity)
         drawdown    = peak_equity - equity
@@ -395,10 +418,12 @@ def run_backtest():
     if pos is not None:
         last   = candles[-1]
         trade_id += 1
-        trades.append(close_trade(pos, last["close"], last["open_time"],
-                                  entry_time, trade_id, "END_OF_PERIOD"))
+        t = close_trade(pos, last["close"], last["open_time"],
+                        entry_time, trade_id, "END_OF_PERIOD")
+        trades.append(t)
+        _end_trade_cycle(t.pnl_usd)
         print(f"  [{dt_str(last['open_time'])}] END   closed @ {last['close']:.2f}  "
-              f"ROI={pos.roi_pct(last['close']):+.1f}%  (trade #{trade_id})")
+              f"ROI={t.roi_pct:+.1f}%  PnL=${t.pnl_usd:+.2f}  (trade #{trade_id})")
 
     # ── Print summary ─────────────────────────────────────────────────────────
     wins       = [t for t in trades if t.pnl_usd > 0]
@@ -415,8 +440,8 @@ def run_backtest():
     print("=" * 42)
     print(f"  Period      : {START_DATE} → {END_DATE}")
     print(f"  Pair        : {PAIR} {INTERVAL}  |  {DIRECTION}  |  {LEVERAGE}x")
-    print(f"  Capital     : ${TOTAL_CAPITAL:,.2f}  "
-          f"({TOTAL_BULLETS} bullets × ${bullet_value:.2f})")
+    print(f"  Capital     : ${TOTAL_CAPITAL:,.2f} → ${running_capital:,.2f}  "
+          f"({TOTAL_BULLETS} bullets)")
     print("-" * 42)
     print(f"  Trades      : {len(trades)}  ({len(wins)} wins, {len(losses)} losses)")
     print(f"  Win rate    : {win_rate:.1f}%")

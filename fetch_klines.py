@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 # =============================================================================
 
 SYMBOL   = "ETHUSDT"   # Options: BTCUSDT, ETHUSDT, ADAUSDT, BTCUSDC
-INTERVAL = "4h"        # Options: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
+INTERVAL = "1d"        # Options: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
 
 # Leave START_DATE as None to fetch the full available history,
 # or set a date string "YYYY-MM-DD" to start from a specific point.
